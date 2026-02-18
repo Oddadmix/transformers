@@ -131,6 +131,7 @@ PROCESSOR_MAPPING_NAMES = OrderedDict(
         ("qwen2_5_omni", "Qwen2_5OmniProcessor"),
         ("qwen2_5_vl", "Qwen2_5_VLProcessor"),
         ("qwen2_audio", "Qwen2AudioProcessor"),
+        ("qwen3_asr", "Qwen3ASRProcessor"),
         ("qwen2_vl", "Qwen2VLProcessor"),
         ("qwen3_5", "Qwen3VLProcessor"),
         ("qwen3_5_moe", "Qwen3VLProcessor"),
