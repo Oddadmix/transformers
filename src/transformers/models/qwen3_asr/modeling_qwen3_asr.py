@@ -16,7 +16,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, Tuple
 
 import numpy as np
 import torch
@@ -38,7 +38,12 @@ from ...modeling_outputs import (
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
-from ...utils import auto_docstring, can_return_tuple
+from ...utils import (
+    add_start_docstrings_to_model_forward,
+    auto_docstring,
+    can_return_tuple,
+    replace_return_docstrings,
+)
 from ...utils.deprecation import deprecate_kwarg
 from ...utils.generic import TransformersKwargs
 
@@ -47,6 +52,9 @@ from .configuration_qwen3_asr import (
     Qwen3ASRConfig,
     Qwen3ASRThinkerConfig,
 )
+
+
+_CONFIG_FOR_DOC = "Qwen3ASRConfig"
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -229,12 +237,13 @@ class Qwen3ASRThinkerTextDecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        output_attentions: bool = False,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states, _ = self.self_attn(
+        hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -251,7 +260,13 @@ class Qwen3ASRThinkerTextDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        return hidden_states
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        return outputs
 
 
 @auto_docstring
@@ -604,13 +619,19 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         padded_embed = torch.cat(padded_embeds, dim=0)
         b, c, f, t = padded_embed.size()
         padded_embed = self.conv_out(padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f))
+        if torch.isnan(padded_embed).any():
+            print("NaN in audio encoder after conv")
 
         positional_embedding = (
             self.positional_embedding.positional_embedding[: padded_embed.shape[1], :]
             .unsqueeze(0)
             .to(padded_embed.dtype)
         )
+        if torch.isnan(positional_embedding).any():
+            print("NaN in audio encoder positional embedding")
         padded_embed = padded_embed + positional_embedding
+        if torch.isnan(padded_embed).any():
+            print("NaN in audio encoder after pos embed")
         hidden_states = padded_embed[padded_mask_after_cnn]
         cu_chunk_lens = [0]
         window_aftercnn = padded_mask_after_cnn.shape[-1] * (self.n_window_infer // (self.n_window * 2))
@@ -857,9 +878,19 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[tuple, BaseModelOutputWithPast]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -901,8 +932,14 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attentions = () if output_attentions else None
+
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -910,15 +947,27 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                output_attentions=output_attentions,
                 **kwargs,
             )
-            hidden_states = layer_outputs
+            hidden_states = layer_outputs[0]
+
+            if output_attentions:
+                all_self_attentions += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, past_key_values, all_hidden_states, all_self_attentions] if v is not None)
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
         )
 
 
@@ -934,7 +983,7 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
 class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditionalGeneration, GenerationMixin):
     config_class = Qwen3ASRThinkerConfig
     base_model_prefix = "thinker"
-    _tied_weights_keys = ["model.embed_tokens.weight", "lm_head.weight"]
+    _tied_weights_keys = {"model.embed_tokens.weight": True, "lm_head.weight": True}
     _no_split_modules = [
         "Qwen3ASRAudioEncoderLayer",
         "Qwen3ASRThinkerTextDecoderLayer",
@@ -988,6 +1037,8 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
                 feature_lens=feature_len.unsqueeze(0),
             )
             audio_feature = audio_output.last_hidden_state
+            if torch.isnan(audio_feature).any():
+                print(f"NaN in audio_feature for len {feature_len}")
             audio_features.append(audio_feature)
         audio_features = torch.cat(audio_features, dim=0)
 
@@ -1178,6 +1229,63 @@ class Qwen3ASRForConditionalGeneration(Qwen3ASRPreTrainedModel, GenerationMixin)
 
     def get_support_languages(self):
         return self.config.support_languages
+
+    def get_input_embeddings(self):
+        return self.thinker.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.thinker.set_input_embeddings(value)
+
+    @replace_return_docstrings(output_type=Qwen3ASRThinkerCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        input_features: torch.FloatTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        feature_attention_mask: Optional[torch.Tensor] = None,
+        audio_feature_lengths: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[list[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[tuple, Qwen3ASRThinkerCausalLMOutputWithPast]:
+        r"""
+        Args:
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+        Returns:
+
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        return self.thinker(
+            input_ids=input_ids,
+            input_features=input_features,
+            attention_mask=attention_mask,
+            feature_attention_mask=feature_attention_mask,
+            audio_feature_lengths=audio_feature_lengths,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            **kwargs,
+        )
 
     @torch.no_grad()
     def generate(
